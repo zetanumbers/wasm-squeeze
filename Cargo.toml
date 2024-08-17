@@ -1,0 +1,8 @@
+[package]
+name = "wasm-squeeze"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasm-encoder = { version = "0.215.0", features = ["wasmparser"] }
+wasmparser = "0.215.0"
