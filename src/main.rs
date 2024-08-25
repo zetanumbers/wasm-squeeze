@@ -1,12 +1,16 @@
 use std::{
+    error::Error,
     fs::File,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::Context;
 use clap::Parser;
-use wasm_encoder as we;
+use wasm_encoder::{
+    self as we,
+    reencode::{self, Reencode},
+};
 use wasmparser as wp;
 
 const UNPACKER_WASM: &[u8] = include_bytes!("upkr_unpacker.wasm");
@@ -33,12 +37,22 @@ fn main() -> anyhow::Result<()> {
     let input = parse_stream_and_save(input, |payload| info.add_payload(payload))
         .context("parsing input as wasm module")?;
     let info = info.build()?;
-    dbg!(info);
-
     let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
 
-    if args.output == Path::new("-") && io::stdout().is_terminal() {
-        anyhow::bail!("stdout is a terminal, cannot print the output wasm binary file");
+    let module = reencode_with_unpacker(&input, info, unpacker)?;
+    let output = module.finish();
+
+    if args.output == Path::new("-") {
+        anyhow::ensure!(
+            !io::stdout().is_terminal(),
+            "stdout is a terminal, cannot print the output wasm binary file"
+        );
+        io::stdout()
+            .lock()
+            .write_all(&output)
+            .context("unable to write an output wasm module")?;
+    } else {
+        std::fs::write(args.output, output).context("unable to write an output wasm module")?;
     }
 
     Ok(())
@@ -104,6 +118,15 @@ struct RelevantInfo {
     old_type_count: u32,
     start_function: u32,
     start_export: u32,
+}
+
+impl RelevantInfo {
+    fn unpacker_reencoder(&self) -> AdaptUnpacker {
+        AdaptUnpacker {
+            old_function_count: self.old_function_count,
+            old_type_count: self.old_type_count,
+        }
+    }
 }
 
 struct RelevantInfoBuilder {
@@ -226,5 +249,97 @@ impl<'a> UnpackerComponents<'a> {
             functions: functions.unwrap(),
             function_bodies,
         })
+    }
+}
+
+fn reencode_with_unpacker<'a>(
+    input_module: &[u8],
+    info: RelevantInfo,
+    unpacker: UnpackerComponents<'a>,
+) -> anyhow::Result<we::Module> {
+    let mut module = we::Module::new();
+    let mut merger = Merger {
+        function_bodies_left: info.old_function_count,
+        info,
+        unpacker,
+    };
+    merger.parse_core_module(&mut module, wp::Parser::new(0), input_module)?;
+
+    return Ok(module);
+
+    struct Merger<'a> {
+        info: RelevantInfo,
+        unpacker: UnpackerComponents<'a>,
+        function_bodies_left: u32,
+    }
+
+    impl<'a> Reencode for Merger<'a> {
+        type Error = io::Error;
+
+        fn parse_type_section(
+            &mut self,
+            types: &mut we::TypeSection,
+            section: wp::TypeSectionReader<'_>,
+        ) -> Result<(), reencode::Error<Self::Error>> {
+            reencode::utils::parse_type_section(self, types, section)?;
+            reencode::utils::parse_type_section(
+                &mut self.info.unpacker_reencoder(),
+                types,
+                self.unpacker.types.clone(),
+            )?;
+            Ok(())
+        }
+
+        fn parse_function_section(
+            &mut self,
+            functions: &mut wasm_encoder::FunctionSection,
+            section: wasmparser::FunctionSectionReader<'_>,
+        ) -> Result<(), reencode::Error<Self::Error>> {
+            reencode::utils::parse_function_section(self, functions, section)?;
+            reencode::utils::parse_function_section(
+                &mut self.info.unpacker_reencoder(),
+                functions,
+                self.unpacker.functions.clone(),
+            )?;
+            Ok(())
+        }
+
+        fn parse_function_body(
+            &mut self,
+            code: &mut wasm_encoder::CodeSection,
+            func: wasmparser::FunctionBody<'_>,
+        ) -> Result<(), reencode::Error<Self::Error>> {
+            reencode::utils::parse_function_body(self, code, func)?;
+            self.function_bodies_left -= 1;
+            if self.function_bodies_left == 0 {
+                let mut unpacker_reencoder = self.info.unpacker_reencoder();
+                for func in &self.unpacker.function_bodies {
+                    reencode::utils::parse_function_body(
+                        &mut unpacker_reencoder,
+                        code,
+                        func.clone(),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+struct AdaptUnpacker {
+    old_function_count: u32,
+    old_type_count: u32,
+}
+
+impl Reencode for AdaptUnpacker {
+    type Error = io::Error;
+
+    fn type_index(&mut self, ty: u32) -> u32 {
+        ty.checked_add(self.old_type_count).expect("too many types")
+    }
+
+    fn function_index(&mut self, func: u32) -> u32 {
+        func.checked_add(self.old_function_count)
+            .expect("too many functions")
     }
 }
