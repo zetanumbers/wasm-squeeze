@@ -57,7 +57,6 @@ typedef unsigned long u32;
 
 typedef struct Context {
     u8* upkr_data_ptr;
-    u8 upkr_probs[1 + 255 + 1 + 2*32 + 2*32]; 
     #ifdef UPKR_BITSTREAM
     u16 upkr_state;
     u8 upkr_current_byte;
@@ -65,6 +64,7 @@ typedef struct Context {
     #else
     u32 upkr_state;
     #endif
+    u8 upkr_probs[1 + 255 + 1 + 2*32 + 2*32];
 } Context;
 
 int upkr_decode_bit(Context* cx, int context_index) {

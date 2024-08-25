@@ -30,10 +30,7 @@ impl Args {
             wasi_sdk: args
                 .opt_free_from_os_str(|s| Result::<_, std::convert::Infallible>::Ok(s.to_owned()))?
                 .or_else(|| env::var_os("WASI_SDK_PATH"))
-                .ok_or_else(|| pico_args::Error::ArgumentParsingFailed {
-                    cause: "No `WASI_SDK_PATH` argument nor such environment variable was found"
-                        .to_owned(),
-                })?
+                .ok_or(pico_args::Error::MissingArgument)?
                 .into(),
         })
     }
@@ -83,9 +80,11 @@ fn main() -> process::ExitCode {
         // "-mcpu=bleeding-edge",
         "-msign-ext",
         "-mbulk-memory",
+        "-mmutable-globals",
         "-fno-exceptions",
         "-DNDEBUG",
         "-Oz",
+        "-nostdlib",
         // "-flto",
         "-Wl,-zstack-size=14752,--no-entry",
         "-Wl,--import-memory",
@@ -94,7 +93,6 @@ fn main() -> process::ExitCode {
         // "-Wl,--lto-O3",
         "-Wl,--strip-debug,--gc-sections",
         "-Wl,--strip-all",
-        "-Wl,--export-dynamic",
     ];
 
     let clang_status = process::Command::new(clang)
