@@ -9,6 +9,8 @@ use clap::Parser;
 use wasm_encoder as we;
 use wasmparser as wp;
 
+const UNPACKER_WASM: &[u8] = include_bytes!("upkr_unpacker.wasm");
+
 #[derive(Parser)]
 struct Args {
     // Input wasm file path. Use `-` or don't specify to use stdin.
@@ -32,6 +34,8 @@ fn main() -> anyhow::Result<()> {
         .context("parsing input as wasm module")?;
     let info = info.build()?;
     dbg!(info);
+
+    let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
 
     if args.output == Path::new("-") && io::stdout().is_terminal() {
         anyhow::bail!("stdout is a terminal, cannot print the output wasm binary file");
@@ -186,6 +190,41 @@ impl RelevantInfoBuilder {
                 .context("No type sections in the module")?,
             start_function,
             start_export,
+        })
+    }
+}
+
+struct UnpackerComponents<'a> {
+    types: wp::TypeSectionReader<'a>,
+    functions: wp::FunctionSectionReader<'a>,
+    function_bodies: Vec<wp::FunctionBody<'a>>,
+}
+
+impl<'a> UnpackerComponents<'a> {
+    fn parse(data: &'a [u8]) -> anyhow::Result<Self> {
+        let mut types = None;
+        let mut functions = None;
+        let mut function_bodies = Vec::new();
+        let parser = wp::Parser::new(0);
+
+        for payload in parser.parse_all(data) {
+            match payload? {
+                wp::Payload::TypeSection(t) => {
+                    anyhow::ensure!(types.is_none(), "multiple type sections found");
+                    types = Some(t);
+                }
+                wp::Payload::FunctionSection(f) => {
+                    anyhow::ensure!(functions.is_none(), "multiple function sections found");
+                    functions = Some(f);
+                }
+                wp::Payload::CodeSectionEntry(function) => function_bodies.push(function),
+                _ => (),
+            }
+        }
+        Ok(UnpackerComponents {
+            types: types.unwrap(),
+            functions: functions.unwrap(),
+            function_bodies,
         })
     }
 }
