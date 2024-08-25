@@ -49,12 +49,12 @@ where
 
     let mut consumed_bytes = 0;
     let mut eof = false;
-    let mut parser = wasmparser::Parser::new(0);
+    let mut parser = wp::Parser::new(0);
     loop {
         let chunk = parser.parse(&input_buffer[consumed_bytes..], eof)?;
 
         let payload = match chunk {
-            wasmparser::Chunk::NeedMoreData(more_bytes) => {
+            wp::Chunk::NeedMoreData(more_bytes) => {
                 let len = input_buffer.len();
                 input_buffer.resize(
                     len.checked_add(more_bytes.try_into()?)
@@ -77,7 +77,7 @@ where
                 }
                 continue;
             }
-            wasmparser::Chunk::Parsed { consumed, payload } => {
+            wp::Chunk::Parsed { consumed, payload } => {
                 consumed_bytes = consumed_bytes + consumed;
                 payload
             }
@@ -97,6 +97,7 @@ where
 struct RelevantInfo {
     stack_global: u32,
     old_function_count: u32,
+    old_type_count: u32,
     start_function: u32,
     start_export: u32,
 }
@@ -104,6 +105,7 @@ struct RelevantInfo {
 struct RelevantInfoBuilder {
     stack_global: Option<u32>,
     old_function_count: Option<u32>,
+    old_type_count: Option<u32>,
     start_function_and_export: Option<(u32, u32)>,
 }
 
@@ -112,6 +114,7 @@ impl RelevantInfoBuilder {
         Self {
             stack_global: None,
             old_function_count: None,
+            old_type_count: None,
             start_function_and_export: None,
         }
     }
@@ -142,6 +145,13 @@ impl RelevantInfoBuilder {
                 );
                 self.old_function_count = Some(functions.count());
             }
+            wp::Payload::TypeSection(types) => {
+                anyhow::ensure!(
+                    self.old_type_count.is_none(),
+                    "encountered two type sections"
+                );
+                self.old_type_count = Some(types.count());
+            }
             wp::Payload::ExportSection(exports) => {
                 for (i, export) in exports.into_iter().enumerate() {
                     let export = export?;
@@ -171,6 +181,9 @@ impl RelevantInfoBuilder {
             old_function_count: self
                 .old_function_count
                 .context("No function sections in the module")?,
+            old_type_count: self
+                .old_type_count
+                .context("No type sections in the module")?,
             start_function,
             start_export,
         })
