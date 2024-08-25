@@ -23,6 +23,9 @@ struct Args {
     // Output wasm file path. Use `-` or don't specify to use stdout.
     #[clap(short, long, default_value = "-")]
     output: PathBuf,
+    // The compression level (0-9)
+    #[clap(short, long, default_value = "9")]
+    level: u8,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -39,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     let info = info.build()?;
     let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
 
-    let module = reencode_with_unpacker(&input, info, unpacker)?;
+    let module = reencode_with_unpacker(&input, info, unpacker, args.level)?;
     let output = module.finish();
 
     if args.output == Path::new("-") {
@@ -111,7 +114,6 @@ where
     Ok(input_buffer)
 }
 
-#[derive(Debug)]
 struct RelevantInfo {
     stack_global: u32,
     old_function_count: u32,
@@ -240,6 +242,9 @@ impl<'a> UnpackerComponents<'a> {
                     anyhow::ensure!(functions.is_none(), "multiple function sections found");
                     functions = Some(f);
                 }
+                wp::Payload::CodeSectionStart { count, .. } => {
+                    function_bodies.reserve(count.try_into().unwrap())
+                }
                 wp::Payload::CodeSectionEntry(function) => function_bodies.push(function),
                 _ => (),
             }
@@ -256,12 +261,14 @@ fn reencode_with_unpacker<'a>(
     input_module: &[u8],
     info: RelevantInfo,
     unpacker: UnpackerComponents<'a>,
+    compression_level: u8,
 ) -> anyhow::Result<we::Module> {
     let mut module = we::Module::new();
     let mut merger = Merger {
         function_bodies_left: info.old_function_count,
         info,
         unpacker,
+        compression_level,
     };
     merger.parse_core_module(&mut module, wp::Parser::new(0), input_module)?;
 
@@ -271,6 +278,7 @@ fn reencode_with_unpacker<'a>(
         info: RelevantInfo,
         unpacker: UnpackerComponents<'a>,
         function_bodies_left: u32,
+        compression_level: u8,
     }
 
     impl<'a> Reencode for Merger<'a> {
@@ -322,6 +330,37 @@ fn reencode_with_unpacker<'a>(
                 }
             }
             Ok(())
+        }
+
+        fn parse_data(
+            &mut self,
+            data: &mut wasm_encoder::DataSection,
+            datum: wasmparser::Data<'_>,
+        ) -> Result<(), reencode::Error<Self::Error>> {
+            if let wp::DataKind::Active {
+                memory_index,
+                offset_expr,
+            } = &datum.kind
+            {
+                let packed = upkr::pack(
+                    datum.data,
+                    self.compression_level,
+                    &upkr::Config::default(),
+                    None,
+                );
+                if packed.len() < datum.data.len() {
+                    data.active(
+                        *memory_index,
+                        &self.const_expr(offset_expr.clone())?,
+                        packed,
+                    );
+                    Ok(())
+                } else {
+                    reencode::utils::parse_data(self, data, datum)
+                }
+            } else {
+                reencode::utils::parse_data(self, data, datum)
+            }
         }
     }
 }
