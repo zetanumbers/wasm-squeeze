@@ -1,5 +1,6 @@
 use std::{
     env,
+    io::Write as _,
     path::{Path, PathBuf},
     process,
 };
@@ -119,8 +120,30 @@ fn main() -> process::ExitCode {
         module.exports.delete(unused_export)
     }
     module.producers.clear();
+    let custom_ids: Vec<_> = module.customs.iter().map(|(i, _s)| i).collect();
+    for custom_id in custom_ids {
+        module.customs.delete(custom_id);
+    }
     walrus::passes::gc::run(&mut module);
-    module.emit_wasm_file(output_wasm).unwrap();
+    let module = module.emit_wasm();
+
+    let wasm_opt = env::var_os("WASM_OPT");
+    let wasm_opt = wasm_opt.as_deref().unwrap_or("wasm-opt".as_ref());
+    let mut wasm_opt = process::Command::new(wasm_opt)
+        .args(["-Oz", "--zero-filled-memory", "--strip-producers"])
+        .arg("-")
+        .args(["-o".as_ref(), output_wasm.as_os_str()])
+        .stdin(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wasm_opt.stdin.take().unwrap().write_all(&module).unwrap();
+    let status = wasm_opt.wait().unwrap();
+
+    assert!(
+        status.success(),
+        "`wasm-opt` failed with status: {status:?}",
+    );
 
     process::ExitCode::SUCCESS
 }
