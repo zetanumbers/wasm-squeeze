@@ -1,10 +1,36 @@
-use std::io::{self, Write};
+use std::{
+    fs::File,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
+use clap::Parser;
 
-fn main() {
-    let input = parse_stream_and_save(io::stdin().lock(), |_| Ok(()))
-        .expect("parsing input as wasm module");
+#[derive(Parser)]
+struct Args {
+    // Input wasm file path. Use `-` or don't specify to use stdin.
+    #[clap(default_value = "-")]
+    input: PathBuf,
+    // Output wasm file path. Use `-` or don't specify to use stdout.
+    #[clap(short, long, default_value = "-")]
+    output: PathBuf,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let input = if args.input == Path::new("-") {
+        Box::new(io::stdin().lock()) as Box<dyn io::Read>
+    } else {
+        Box::new(io::BufReader::new(File::open(args.input)?))
+    };
+    let input = parse_stream_and_save(input, |_| Ok(())).context("parsing input as wasm module")?;
+
+    if args.output == Path::new("-") && io::stdout().is_terminal() {
+        anyhow::bail!("stdout is a terminal, cannot print the output wasm binary file");
+    }
+
+    Ok(())
 }
 
 fn parse_stream_and_save<R, F>(mut reader: R, mut consumer: F) -> anyhow::Result<Vec<u8>>

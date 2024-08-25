@@ -9,5 +9,6 @@ license = "Apache-2.0 OR MIT"
 
 [dependencies]
 anyhow = "1.0.86"
+clap = { version = "4.5.16", features = ["derive"] }
 wasm-encoder = { version = "0.215.0", features = ["wasmparser"] }
 wasmparser = "0.215.0"
