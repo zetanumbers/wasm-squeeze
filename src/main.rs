@@ -1,7 +1,7 @@
 use std::{
-    error::Error,
     fs::File,
     io::{self, IsTerminal, Write},
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -40,6 +40,7 @@ fn main() -> anyhow::Result<()> {
     let input = parse_stream_and_save(input, |payload| info.add_payload(payload))
         .context("parsing input as wasm module")?;
     let info = info.build()?;
+    dbg!(&info);
     let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
 
     let module = reencode_with_unpacker(&input, info, unpacker, args.level)?;
@@ -114,12 +115,25 @@ where
     Ok(input_buffer)
 }
 
+#[derive(Debug)]
 struct RelevantInfo {
-    stack_global: u32,
+    stack: Stack,
+    start: Start,
     old_function_count: u32,
     old_type_count: u32,
-    start_function: u32,
-    start_export: u32,
+    top_zeros_start: u32,
+}
+
+#[derive(Debug)]
+struct Stack {
+    global_idx: u32,
+    mem_range: Range<u32>,
+}
+
+#[derive(Debug)]
+struct Start {
+    function_idx: u32,
+    export_idx: u32,
 }
 
 impl RelevantInfo {
@@ -132,19 +146,21 @@ impl RelevantInfo {
 }
 
 struct RelevantInfoBuilder {
-    stack_global: Option<u32>,
+    stack: Option<Stack>,
+    start: Option<Start>,
+    data_ranges: Vec<Range<u32>>,
     old_function_count: Option<u32>,
     old_type_count: Option<u32>,
-    start_function_and_export: Option<(u32, u32)>,
 }
 
 impl RelevantInfoBuilder {
     fn new() -> Self {
         Self {
-            stack_global: None,
+            stack: None,
+            start: None,
+            data_ranges: Vec::new(),
             old_function_count: None,
             old_type_count: None,
-            start_function_and_export: None,
         }
     }
 
@@ -160,11 +176,38 @@ impl RelevantInfoBuilder {
                             global.ty.content_type
                         );
                         anyhow::ensure!(
-                            self.stack_global.is_none(),
+                            self.stack.is_none(),
                             "encountered a second mutable global"
                         );
-                        self.stack_global = Some(i.try_into().unwrap());
+                        self.stack = Some(Stack {
+                            global_idx: i.try_into().unwrap(),
+                            mem_range: 0..eval_u32(&global.init_expr)
+                                .context("evaluating presumed stack global")?,
+                        });
                     }
+                }
+            }
+            wp::Payload::DataSection(data) => {
+                self.data_ranges.reserve(data.count().try_into()?);
+                for data in data {
+                    let data = data?;
+                    let wp::DataKind::Active {
+                        memory_index,
+                        offset_expr,
+                    } = &data.kind
+                    else {
+                        continue;
+                    };
+                    anyhow::ensure!(*memory_index == 0, "multi memory is not supported");
+                    let offset =
+                        eval_u32(&offset_expr).context("evaluating a data offset expression")?;
+                    let size: u32 = data.data.len().try_into()?;
+                    self.data_ranges.push(
+                        offset
+                            ..offset
+                                .checked_add(size)
+                                .context("overflow when calculating data offset")?,
+                    )
                 }
             }
             wp::Payload::FunctionSection(functions) => {
@@ -187,11 +230,11 @@ impl RelevantInfoBuilder {
                     if export.name != "start" {
                         continue;
                     }
-                    anyhow::ensure!(
-                        self.start_function_and_export.is_none(),
-                        "found multiple `start` exports"
-                    );
-                    self.start_function_and_export = Some((export.index, i.try_into().unwrap()));
+                    anyhow::ensure!(self.start.is_none(), "found multiple `start` exports");
+                    self.start = Some(Start {
+                        export_idx: export.index,
+                        function_idx: i.try_into().unwrap(),
+                    });
                 }
             }
             _ => {}
@@ -200,21 +243,27 @@ impl RelevantInfoBuilder {
     }
 
     fn build(self) -> anyhow::Result<RelevantInfo> {
-        let (start_function, start_export) = self
-            .start_function_and_export
-            .context("`start` export was not found")?;
+        let mut stack = self.stack.context("No stack global variable was found")?;
+        for data in &self.data_ranges {
+            if data.start < stack.mem_range.end {
+                stack.mem_range.start = stack.mem_range.start.max(data.end);
+            }
+        }
+        anyhow::ensure!(
+            stack.mem_range.len() > 0,
+            "stack space intersects initialized memory"
+        );
+        let top_zeros_start = self.data_ranges.iter().map(|r| r.end).max().unwrap_or(0);
         Ok(RelevantInfo {
-            stack_global: self
-                .stack_global
-                .context("No stack global variable was found")?,
+            stack,
             old_function_count: self
                 .old_function_count
                 .context("No function sections in the module")?,
             old_type_count: self
                 .old_type_count
                 .context("No type sections in the module")?,
-            start_function,
-            start_export,
+            start: self.start.context("`start` export was not found")?,
+            top_zeros_start,
         })
     }
 }
@@ -381,4 +430,16 @@ impl Reencode for AdaptUnpacker {
         func.checked_add(self.old_function_count)
             .expect("too many functions")
     }
+}
+
+fn eval_u32(expr: &wp::ConstExpr) -> anyhow::Result<u32> {
+    let mut reader = expr.get_operators_reader();
+    let wp::Operator::I32Const { value } = reader.read()? else {
+        anyhow::bail!("Expected expression to be a single `I32Const`");
+    };
+    anyhow::ensure!(
+        matches!(reader.read()?, wp::Operator::End),
+        "Expression has unexpected succeeding operators"
+    );
+    Ok(value as u32)
 }
