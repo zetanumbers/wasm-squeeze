@@ -3,6 +3,7 @@ use std::{
     io::{self, IsTerminal, Write},
     ops::Range,
     path::{Path, PathBuf},
+    process::{self, Termination},
 };
 
 use anyhow::Context;
@@ -28,7 +29,18 @@ struct Args {
     level: u8,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> process::ExitCode {
+    match try_main() {
+        Ok(()) => process::ExitCode::SUCCESS,
+        Err(e) => {
+            log::error!("{e:?}");
+            process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> anyhow::Result<()> {
+    env_logger::try_init_from_env("WASM_SQUEEZE_LOG")?;
     let args = Args::parse();
     let input = if args.input == Path::new("-") {
         Box::new(io::stdin().lock()) as Box<dyn io::Read>
@@ -40,7 +52,7 @@ fn main() -> anyhow::Result<()> {
     let input = parse_stream_and_save(input, |payload| info.add_payload(payload))
         .context("parsing input as wasm module")?;
     let info = info.build()?;
-    dbg!(&info);
+    log::debug!("Retrieved relevant info from the input module:\n{info:#?}");
     let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
 
     let module = reencode_with_unpacker(&input, info, unpacker, args.level)?;
