@@ -1,9 +1,11 @@
+use core::fmt;
 use std::{
+    error::Error,
     fs::File,
     io::{self, IsTerminal, Write},
     ops::Range,
     path::{Path, PathBuf},
-    process::{self, Termination},
+    process,
 };
 
 use anyhow::Context;
@@ -12,8 +14,27 @@ use wasm_encoder::{
     self as we,
     reencode::{self, Reencode},
 };
-use wasmparser as wp;
+use wasmparser::{self as wp, FromReader};
 
+/// Supported wasm features
+const WASM_FEATURES: wp::WasmFeatures = {
+    use wp::WasmFeatures as Ft;
+
+    Ft::BULK_MEMORY
+        .union(Ft::EXCEPTIONS)
+        .union(Ft::FLOATS)
+        .union(Ft::FUNCTION_REFERENCES)
+        .union(Ft::GC)
+        .union(Ft::LEGACY_EXCEPTIONS)
+        .union(Ft::MULTI_VALUE)
+        .union(Ft::MUTABLE_GLOBAL)
+        .union(Ft::REFERENCE_TYPES)
+        .union(Ft::RELAXED_SIMD)
+        .union(Ft::SATURATING_FLOAT_TO_INT)
+        .union(Ft::SIGN_EXTENSION)
+        .union(Ft::SIMD)
+        .union(Ft::TAIL_CALL)
+};
 const UNPACKER_WASM: &[u8] = include_bytes!("upkr_unpacker.wasm");
 
 #[derive(Parser)]
@@ -40,41 +61,70 @@ fn main() -> process::ExitCode {
 }
 
 fn try_main() -> anyhow::Result<()> {
-    env_logger::try_init_from_env("WASM_SQUEEZE_LOG")?;
+    env_logger::try_init_from_env(
+        env_logger::Env::new()
+            .filter_or("WASM_SQUEEZE_LOG", "info")
+            .write_style("WASM_SQUEEZE_LOG_STYLE"),
+    )?;
     let args = Args::parse();
     let input = if args.input == Path::new("-") {
         Box::new(io::stdin().lock()) as Box<dyn io::Read>
     } else {
-        Box::new(io::BufReader::new(File::open(args.input)?))
+        Box::new(io::BufReader::new(File::open(&args.input)?))
     };
 
     let mut info = RelevantInfoBuilder::new();
     let input = parse_stream_and_save(input, |payload| info.add_payload(payload))
         .context("parsing input as wasm module")?;
-    let info = info.build()?;
+    let info = match info.build(&input) {
+        Ok(info) => info,
+        Err(err) => {
+            for cause in err.chain() {
+                if cause.is::<NoDataError>() {
+                    log::warn!("No data to compress, simply passing through the input");
+                    write_output(&args, &input).context("writing an output wasm module")?;
+                    return Ok(());
+                }
+            }
+            return Err(err);
+        }
+    };
     log::debug!("Retrieved relevant info from the input module:\n{info:#?}");
     let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
 
     let module = reencode_with_unpacker(&input, info, unpacker, args.level)?;
     let output = module.finish();
 
-    if args.output == Path::new("-") {
+    let reduced_bytes = input.len() as isize - output.len() as isize;
+    if reduced_bytes <= 0 {
+        log::warn!(
+            "Compression did not reduce wasm module's size, simply passing through the input"
+        );
+        write_output(&args, &input).context("writing an output wasm module")?;
+    } else {
+        log::info!(
+            "Reduced wasm module size by {} bytes ({:.2}%)",
+            reduced_bytes,
+            (100.0 * reduced_bytes as f64 / input.len() as f64)
+        );
+        write_output(&args, &output).context("writing an output wasm module")?;
+    }
+    Ok(())
+}
+
+fn write_output(args: &Args, output: &[u8]) -> Result<(), anyhow::Error> {
+    Ok(if args.output == Path::new("-") {
         anyhow::ensure!(
             !io::stdout().is_terminal(),
             "stdout is a terminal, cannot print the output wasm binary file"
         );
-        io::stdout()
-            .lock()
-            .write_all(&output)
-            .context("unable to write an output wasm module")?;
+        io::stdout().lock().write_all(output)?;
     } else {
-        std::fs::write(args.output, output).context("unable to write an output wasm module")?;
-    }
-
-    Ok(())
+        std::fs::write(&args.output, output)?;
+    })
 }
 
-fn parse_stream_and_save<R, F>(mut reader: R, mut consumer: F) -> anyhow::Result<Vec<u8>>
+fn parse_stream_and_save<'a, R, F>(mut reader: R, mut consumer: F) -> anyhow::Result<Vec<u8>>
 where
     R: io::Read,
     F: FnMut(wp::Payload) -> anyhow::Result<()>,
@@ -84,6 +134,8 @@ where
     let mut consumed_bytes = 0;
     let mut eof = false;
     let mut parser = wp::Parser::new(0);
+    parser.set_features(WASM_FEATURES);
+
     loop {
         let chunk = parser.parse(&input_buffer[consumed_bytes..], eof)?;
 
@@ -131,9 +183,9 @@ where
 struct RelevantInfo {
     stack: Stack,
     start: Start,
+    data: Data<Vec<u8>>,
     old_function_count: u32,
     old_type_count: u32,
-    top_zeros_start: u32,
 }
 
 #[derive(Debug)]
@@ -148,6 +200,51 @@ struct Start {
     export_idx: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Data<D> {
+    offset: u32,
+    data: D,
+}
+
+impl Data<Range<usize>> {
+    fn parse_slice<'a>(&self, module: &'a [u8]) -> anyhow::Result<Data<&'a [u8]>> {
+        let mut reader =
+            wp::BinaryReader::new(&module[self.data.clone()], self.data.start, WASM_FEATURES);
+        let data = wp::Data::from_reader(&mut reader)?;
+
+        #[cfg(debug_assertions)]
+        {
+            let wp::DataKind::Active {
+                memory_index,
+                offset_expr,
+            } = data.kind
+            else {
+                panic!("parsed data kind mismatch")
+            };
+            debug_assert_eq!(memory_index, 0, "multimemory is not supported");
+            debug_assert_eq!(
+                eval_u32(&offset_expr).context("evaluating data offset")?,
+                self.offset,
+                "parsed data offset mismatch"
+            );
+        }
+
+        Ok(Data {
+            data: data.data,
+            offset: self.offset,
+        })
+    }
+}
+
+impl Data<&[u8]> {
+    fn to_vec(&self) -> Data<Vec<u8>> {
+        Data {
+            offset: self.offset,
+            data: self.data.to_owned(),
+        }
+    }
+}
+
 impl RelevantInfo {
     fn unpacker_reencoder(&self) -> AdaptUnpacker {
         AdaptUnpacker {
@@ -160,7 +257,7 @@ impl RelevantInfo {
 struct RelevantInfoBuilder {
     stack: Option<Stack>,
     start: Option<Start>,
-    data_ranges: Vec<Range<u32>>,
+    data: Vec<Data<Range<usize>>>,
     old_function_count: Option<u32>,
     old_type_count: Option<u32>,
 }
@@ -170,7 +267,7 @@ impl RelevantInfoBuilder {
         Self {
             stack: None,
             start: None,
-            data_ranges: Vec::new(),
+            data: Vec::new(),
             old_function_count: None,
             old_type_count: None,
         }
@@ -200,7 +297,8 @@ impl RelevantInfoBuilder {
                 }
             }
             wp::Payload::DataSection(data) => {
-                self.data_ranges.reserve(data.count().try_into()?);
+                anyhow::ensure!(self.data.is_empty(), "encountered multiple data sections");
+                self.data.reserve(data.count().try_into()?);
                 for data in data {
                     let data = data?;
                     let wp::DataKind::Active {
@@ -213,26 +311,23 @@ impl RelevantInfoBuilder {
                     anyhow::ensure!(*memory_index == 0, "multi memory is not supported");
                     let offset =
                         eval_u32(&offset_expr).context("evaluating a data offset expression")?;
-                    let size: u32 = data.data.len().try_into()?;
-                    self.data_ranges.push(
-                        offset
-                            ..offset
-                                .checked_add(size)
-                                .context("overflow when calculating data offset")?,
-                    )
+                    self.data.push(Data {
+                        data: data.range,
+                        offset,
+                    })
                 }
             }
             wp::Payload::FunctionSection(functions) => {
                 anyhow::ensure!(
                     self.old_function_count.is_none(),
-                    "encountered two function sections"
+                    "encountered multiple function sections"
                 );
                 self.old_function_count = Some(functions.count());
             }
             wp::Payload::TypeSection(types) => {
                 anyhow::ensure!(
                     self.old_type_count.is_none(),
-                    "encountered two type sections"
+                    "encountered multiple type sections"
                 );
                 self.old_type_count = Some(types.count());
             }
@@ -254,31 +349,60 @@ impl RelevantInfoBuilder {
         Ok(())
     }
 
-    fn build(self) -> anyhow::Result<RelevantInfo> {
-        let mut stack = self.stack.context("No stack global variable was found")?;
-        for data in &self.data_ranges {
-            if data.start < stack.mem_range.end {
-                stack.mem_range.start = stack.mem_range.start.max(data.end);
-            }
+    fn build(mut self, input: &[u8]) -> anyhow::Result<RelevantInfo> {
+        if self.data.is_empty() {
+            return Err(NoDataError.into());
         }
+        // zero sized data is't supported
+        self.data.sort_unstable_by_key(|d| d.offset);
+
+        // Merge data sections
+        let mut data = self.data.iter();
+        let mut output_data = data.next().unwrap().parse_slice(&input)?.to_vec();
+        let mut init_bytes = 0;
+
+        for data in data {
+            init_bytes += data.data.len();
+            let new_len = (data.offset - output_data.offset) as usize;
+            anyhow::ensure!(output_data.data.len() <= new_len, "data sections overlap");
+            output_data.data.resize(new_len, 0);
+            output_data
+                .data
+                .extend_from_slice(data.parse_slice(&input)?.data);
+        }
+        log::info!(
+            "Data section's memory has {:.2}% of initialized bytes",
+            100.0 * init_bytes as f64 / output_data.data.len() as f64
+        );
+
+        let stack = self.stack.context("No stack global variable was found")?;
         anyhow::ensure!(
-            stack.mem_range.len() > 0,
+            stack.mem_range.start.max(output_data.offset) as usize
+                > (stack.mem_range.end as usize)
+                    .min(output_data.offset as usize + output_data.data.len()),
             "stack space intersects initialized memory"
         );
-        let top_zeros_start = self.data_ranges.iter().map(|r| r.end).max().unwrap_or(0);
+
         Ok(RelevantInfo {
             stack,
-            old_function_count: self
-                .old_function_count
-                .context("No function sections in the module")?,
-            old_type_count: self
-                .old_type_count
-                .context("No type sections in the module")?,
+            old_function_count: self.old_function_count.unwrap_or(0),
+            old_type_count: self.old_type_count.unwrap_or(0),
             start: self.start.context("`start` export was not found")?,
-            top_zeros_start,
+            data: output_data,
         })
     }
 }
+
+#[derive(Debug)]
+struct NoDataError;
+
+impl fmt::Display for NoDataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        "no data to compress".fmt(f)
+    }
+}
+
+impl Error for NoDataError {}
 
 struct UnpackerComponents<'a> {
     types: wp::TypeSectionReader<'a>,
@@ -291,7 +415,8 @@ impl<'a> UnpackerComponents<'a> {
         let mut types = None;
         let mut functions = None;
         let mut function_bodies = Vec::new();
-        let parser = wp::Parser::new(0);
+        let mut parser = wp::Parser::new(0);
+        parser.set_features(WASM_FEATURES);
 
         for payload in parser.parse_all(data) {
             match payload? {
@@ -393,34 +518,25 @@ fn reencode_with_unpacker<'a>(
             Ok(())
         }
 
-        fn parse_data(
+        fn parse_data_section(
             &mut self,
-            data: &mut wasm_encoder::DataSection,
-            datum: wasmparser::Data<'_>,
+            data: &mut we::DataSection,
+            _section: wp::DataSectionReader<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
-            if let wp::DataKind::Active {
-                memory_index,
-                offset_expr,
-            } = &datum.kind
-            {
-                let packed = upkr::pack(
-                    datum.data,
-                    self.compression_level,
-                    &upkr::Config::default(),
-                    None,
-                );
-                if packed.len() < datum.data.len() {
-                    data.active(
-                        *memory_index,
-                        &self.const_expr(offset_expr.clone())?,
-                        packed,
-                    );
-                    Ok(())
-                } else {
-                    reencode::utils::parse_data(self, data, datum)
-                }
+            let offset = we::ConstExpr::i32_const(self.info.data.offset as i32);
+            let packed = upkr::pack(
+                &self.info.data.data,
+                self.compression_level,
+                &upkr::Config::default(),
+                None,
+            );
+            if packed.len() < self.info.data.data.len() {
+                data.active(0, &offset, packed);
+                Ok(())
             } else {
-                reencode::utils::parse_data(self, data, datum)
+                log::warn!("Could not compress data into less bytes, writing old");
+                data.active(0, &offset, self.info.data.data.iter().copied());
+                Ok(())
             }
         }
     }

@@ -8,7 +8,7 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-anyhow = "1.0.86"
+anyhow = { version = "1.0.86", features = ["std"] }
 clap = { version = "4.5.16", features = ["derive"] }
 env_logger = { version = "0.11.5", default-features = false, features = ["auto-color"] }
 log = "0.4.22"
