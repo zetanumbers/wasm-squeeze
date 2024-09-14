@@ -41,6 +41,12 @@ const UNPACKER_WASM: &[u8] = include_bytes!("upkr_unpacker.wasm");
 const MEM_SIZE: i32 = 0x10000;
 const CONTEXT_OFFSET: i32 = 0;
 const COMPRESSED_DATA_OFFSET: i32 = common::CONTEXT_SIZE;
+const PALETTE_OFFSET: i32 = 4;
+const PALETTE_DEFAULT: i128 = 0xe0f8cf86c06c306850071821;
+const DRAW_COLORS_DEFAULT: i16 = 0x1203;
+const DRAW_COLORS_OFFSET: i32 = 0x14;
+const MOUSE_XY_DEFAULT: i32 = 0x7fff7fff;
+const MOUSE_XY_OFFSET: i32 = 0x1a;
 
 #[derive(Parser)]
 struct Args {
@@ -205,6 +211,18 @@ impl fmt::Debug for Data<Vec<u8>> {
         f.debug_struct("Data")
             .field("offset", &self.offset)
             .field("data", &format_args!("[u8; {}]", self.data.len()))
+            .finish()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Data<Range<T>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Data")
+            .field("offset", &self.offset)
+            .field(
+                "data",
+                &format_args!("{:?}..{:?}", self.data.start, self.data.end),
+            )
             .finish()
     }
 }
@@ -381,17 +399,17 @@ impl RelevantInfoBuilder {
 
         // Merge data sections
         let mut data = self.data.iter();
-        let mut output_data = data.next().unwrap().parse_slice(&input)?.to_vec();
-        let mut init_bytes = 0;
+        let first_data = data.next().unwrap().parse_slice(&input)?;
+        let mut init_bytes = first_data.data.len();
+        let mut output_data = first_data.to_vec();
 
         for data in data {
+            let data = data.parse_slice(&input)?;
             init_bytes += data.data.len();
             let new_len = (data.offset - output_data.offset) as usize;
             anyhow::ensure!(output_data.data.len() <= new_len, "data sections overlap");
             output_data.data.resize(new_len, 0);
-            output_data
-                .data
-                .extend_from_slice(data.parse_slice(&input)?.data);
+            output_data.data.extend_from_slice(data.data);
         }
         log::info!(
             "Data section's memory has {:.2}% of initialized bytes",
@@ -675,6 +693,30 @@ fn reencode_with_unpacker<'a>(
                 .instruction(&we::Instruction::I32Const(0))
                 .instruction(&we::Instruction::I32Const(MEM_SIZE - original_data_end))
                 .instruction(&we::Instruction::MemoryFill(0));
+
+            func.instruction(&we::Instruction::I32Const(PALETTE_OFFSET))
+                .instruction(&we::Instruction::V128Const(PALETTE_DEFAULT))
+                .instruction(&we::Instruction::V128Store(we::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+            func.instruction(&we::Instruction::I32Const(DRAW_COLORS_OFFSET))
+                .instruction(&we::Instruction::I32Const(DRAW_COLORS_DEFAULT.into()))
+                .instruction(&we::Instruction::I32Store16(we::MemArg {
+                    offset: 0,
+                    align: 1,
+                    memory_index: 0,
+                }));
+
+            func.instruction(&we::Instruction::I32Const(MOUSE_XY_OFFSET))
+                .instruction(&we::Instruction::I32Const(MOUSE_XY_DEFAULT))
+                .instruction(&we::Instruction::I32Store(we::MemArg {
+                    offset: 0,
+                    align: 1,
+                    memory_index: 0,
+                }));
         }
     }
 }
