@@ -343,18 +343,9 @@ impl RelevantInfoBuilder {
                 );
                 self.old_type_count = Some(types.count());
             }
-            wp::Payload::ExportSection(exports) => {
-                for export in exports.into_iter() {
-                    let export = export?;
-                    if export.name != "start" {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        self.start_fn_idx.is_none(),
-                        "found multiple `start` exports"
-                    );
-                    self.start_fn_idx = Some(export.index);
-                }
+            wp::Payload::StartSection { func, .. } => {
+                anyhow::ensure!(self.start_fn_idx.is_none(), "found multiple start sections");
+                self.start_fn_idx = Some(func);
             }
             _ => {}
         }
@@ -516,9 +507,9 @@ fn reencode_with_unpacker<'a>(
             + info.old_function_count
             + unpacker.unpack_fn_idx,
         subroutine_fn_type_idx: info.old_type_count + unpacker.types.count(),
-        new_start_fn_idx: info.import_function_count
-            + info.old_function_count
-            + unpacker.functions.count(),
+        new_start_fn_idx: info.start_fn_idx.unwrap_or_else(|| {
+            info.import_function_count + info.old_function_count + unpacker.functions.count()
+        }),
         info,
         packed_data,
         unpacker,
@@ -569,7 +560,13 @@ fn reencode_with_unpacker<'a>(
                 functions,
                 self.unpacker.functions.clone(),
             )?;
-            functions.function(self.subroutine_fn_type_idx);
+            if self.info.start_fn_idx.is_none() {
+                assert_eq!(
+                    self.info.import_function_count + functions.len(),
+                    self.new_start_fn_idx
+                );
+                functions.function(self.subroutine_fn_type_idx);
+            }
             Ok(())
         }
 
@@ -578,7 +575,19 @@ fn reencode_with_unpacker<'a>(
             code: &mut we::CodeSection,
             func: wp::FunctionBody<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
-            reencode::utils::parse_function_body(self, code, func)?;
+            if Some(self.info.import_function_count + code.len()) != self.info.start_fn_idx
+                && self.packed_data.is_some()
+            {
+                reencode::utils::parse_function_body(self, code, func)?;
+            } else {
+                let mut f = self.new_function_with_parsed_locals(&func)?;
+                self.encode_prefix_instrs(&mut f);
+                let mut reader = func.get_operators_reader()?;
+                while !reader.eof() {
+                    self.parse_instruction(&mut f, &mut reader)?;
+                }
+                code.function(&f);
+            }
             self.function_bodies_left -= 1;
             if self.function_bodies_left == 0 {
                 // Last function body parsed
@@ -591,46 +600,13 @@ fn reencode_with_unpacker<'a>(
                         func.clone(),
                     )?;
                 }
-                if self.packed_data.is_some() {
+                if self.info.start_fn_idx.is_none() && self.packed_data.is_some() {
                     assert_eq!(
                         self.info.import_function_count + code.len(),
                         self.new_start_fn_idx
                     );
                     let mut func = we::Function::new(iter::empty());
-
-                    let original_data_len = self.info.data.data.len().try_into().unwrap();
-                    let destination_offset = MEM_SIZE.checked_sub(original_data_len).unwrap();
-                    let original_data_offset = self.info.data.offset.try_into().unwrap();
-                    assert!(destination_offset >= 0);
-
-                    func.instruction(&we::Instruction::I32Const(CONTEXT_OFFSET))
-                        .instruction(&we::Instruction::I32Const(destination_offset))
-                        .instruction(&we::Instruction::I32Const(COMPRESSED_DATA_OFFSET))
-                        .instruction(&we::Instruction::Call(self.unpack_fn_idx))
-                        .instruction(&we::Instruction::Drop);
-
-                    func.instruction(&we::Instruction::I32Const(original_data_offset))
-                        .instruction(&we::Instruction::I32Const(destination_offset))
-                        .instruction(&we::Instruction::I32Const(original_data_len))
-                        .instruction(&we::Instruction::MemoryCopy {
-                            src_mem: 0,
-                            dst_mem: 0,
-                        });
-
-                    func.instruction(&we::Instruction::I32Const(0))
-                        .instruction(&we::Instruction::I32Const(0))
-                        .instruction(&we::Instruction::I32Const(original_data_offset))
-                        .instruction(&we::Instruction::MemoryFill(0));
-
-                    let original_data_end = original_data_offset + original_data_len;
-                    func.instruction(&we::Instruction::I32Const(original_data_end))
-                        .instruction(&we::Instruction::I32Const(0))
-                        .instruction(&we::Instruction::I32Const(MEM_SIZE - original_data_end))
-                        .instruction(&we::Instruction::MemoryFill(0));
-
-                    if let Some(start) = self.info.start_fn_idx {
-                        func.instruction(&we::Instruction::Call(start));
-                    }
+                    self.encode_prefix_instrs(&mut func);
                     func.instruction(&we::Instruction::End);
                     code.function(&func);
                 }
@@ -653,30 +629,52 @@ fn reencode_with_unpacker<'a>(
             Ok(())
         }
 
-        fn parse_export_section(
+        fn intersperse_section_hook(
             &mut self,
-            exports: &mut we::ExportSection,
-            section: wp::ExportSectionReader<'_>,
+            module: &mut we::Module,
+            after: Option<we::SectionId>,
+            _before: Option<we::SectionId>,
         ) -> Result<(), reencode::Error<Self::Error>> {
-            if self.packed_data.is_none() {
-                return reencode::utils::parse_export_section(self, exports, section);
-            }
-
-            let mut start_encoded = false;
-            for export in section {
-                let export = export?;
-                if export.name == "start" {
-                    assert!(!start_encoded);
-                    exports.export("start", we::ExportKind::Func, self.new_start_fn_idx);
-                    start_encoded = true;
-                } else {
-                    reencode::utils::parse_export(self, exports, export)
-                }
-            }
-            if !start_encoded {
-                exports.export("start", we::ExportKind::Func, self.new_start_fn_idx);
+            if after == Some(we::SectionId::Export) && self.info.start_fn_idx.is_none() {
+                module.section(&we::StartSection {
+                    function_index: self.new_start_fn_idx,
+                });
             }
             Ok(())
+        }
+    }
+
+    impl<'a> Merger<'a> {
+        fn encode_prefix_instrs(&mut self, func: &mut we::Function) {
+            let original_data_len = self.info.data.data.len().try_into().unwrap();
+            let destination_offset = MEM_SIZE.checked_sub(original_data_len).unwrap();
+            let original_data_offset = self.info.data.offset.try_into().unwrap();
+            assert!(destination_offset >= 0);
+
+            func.instruction(&we::Instruction::I32Const(CONTEXT_OFFSET))
+                .instruction(&we::Instruction::I32Const(destination_offset))
+                .instruction(&we::Instruction::I32Const(COMPRESSED_DATA_OFFSET))
+                .instruction(&we::Instruction::Call((&mut *self).unpack_fn_idx))
+                .instruction(&we::Instruction::Drop);
+
+            func.instruction(&we::Instruction::I32Const(original_data_offset))
+                .instruction(&we::Instruction::I32Const(destination_offset))
+                .instruction(&we::Instruction::I32Const(original_data_len))
+                .instruction(&we::Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+
+            func.instruction(&we::Instruction::I32Const(0))
+                .instruction(&we::Instruction::I32Const(0))
+                .instruction(&we::Instruction::I32Const(original_data_offset))
+                .instruction(&we::Instruction::MemoryFill(0));
+
+            let original_data_end = original_data_offset + original_data_len;
+            func.instruction(&we::Instruction::I32Const(original_data_end))
+                .instruction(&we::Instruction::I32Const(0))
+                .instruction(&we::Instruction::I32Const(MEM_SIZE - original_data_end))
+                .instruction(&we::Instruction::MemoryFill(0));
         }
     }
 }
