@@ -186,24 +186,11 @@ where
 
 #[derive(Debug)]
 struct RelevantInfo {
-    stack: Stack,
-    start: Option<Start>,
+    start_fn_idx: Option<u32>,
     data: Data<Vec<u8>>,
     old_function_count: u32,
     old_type_count: u32,
     import_function_count: u32,
-}
-
-#[derive(Debug)]
-struct Stack {
-    global_idx: u32,
-    mem_range: Range<i32>,
-}
-
-#[derive(Debug)]
-struct Start {
-    function_idx: u32,
-    export_idx: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -270,8 +257,7 @@ impl RelevantInfo {
 }
 
 struct RelevantInfoBuilder {
-    stack: Option<Stack>,
-    start: Option<Start>,
+    start_fn_idx: Option<u32>,
     data: Vec<Data<Range<usize>>>,
     old_functions: Option<Vec<u32>>,
     old_type_count: Option<u32>,
@@ -281,8 +267,7 @@ struct RelevantInfoBuilder {
 impl RelevantInfoBuilder {
     fn new() -> Self {
         Self {
-            stack: None,
-            start: None,
+            start_fn_idx: None,
             data: Vec::new(),
             old_functions: None,
             old_type_count: None,
@@ -292,27 +277,6 @@ impl RelevantInfoBuilder {
 
     fn add_payload(&mut self, payload: wp::Payload) -> anyhow::Result<()> {
         match payload {
-            wp::Payload::GlobalSection(globals) => {
-                for (i, global) in globals.into_iter().enumerate() {
-                    let global = global?;
-                    if global.ty.mutable {
-                        anyhow::ensure!(
-                            global.ty.content_type == wp::ValType::I32,
-                            "encountered a mutable global with unexpected type: {:?}",
-                            global.ty.content_type
-                        );
-                        anyhow::ensure!(
-                            self.stack.is_none(),
-                            "encountered a second mutable global"
-                        );
-                        self.stack = Some(Stack {
-                            global_idx: i.try_into().unwrap(),
-                            mem_range: 0..eval_i32(&global.init_expr)
-                                .context("evaluating presumed stack global")?,
-                        });
-                    }
-                }
-            }
             wp::Payload::DataSection(data) => {
                 anyhow::ensure!(self.data.is_empty(), "encountered multiple data sections");
                 self.data.reserve(data.count().try_into()?);
@@ -367,16 +331,16 @@ impl RelevantInfoBuilder {
                 self.old_type_count = Some(types.count());
             }
             wp::Payload::ExportSection(exports) => {
-                for (i, export) in exports.into_iter().enumerate() {
+                for export in exports.into_iter() {
                     let export = export?;
                     if export.name != "start" {
                         continue;
                     }
-                    anyhow::ensure!(self.start.is_none(), "found multiple `start` exports");
-                    self.start = Some(Start {
-                        export_idx: i.try_into().unwrap(),
-                        function_idx: export.index,
-                    });
+                    anyhow::ensure!(
+                        self.start_fn_idx.is_none(),
+                        "found multiple `start` exports"
+                    );
+                    self.start_fn_idx = Some(export.index);
                 }
             }
             _ => {}
@@ -410,23 +374,14 @@ impl RelevantInfoBuilder {
             100.0 * init_bytes as f64 / output_data.data.len() as f64
         );
 
-        let stack = self.stack.context("No stack global variable was found")?;
-        anyhow::ensure!(
-            stack.mem_range.start.max(output_data.offset) as usize
-                > (stack.mem_range.end as usize)
-                    .min(output_data.offset as usize + output_data.data.len()),
-            "stack space intersects initialized memory"
-        );
-
         let old_functions = self
             .old_functions
             .context("no function section encountered")?;
         Ok(RelevantInfo {
-            stack,
             old_function_count: old_functions.len().try_into().unwrap(),
             import_function_count: self.import_function_count.unwrap_or(0),
             old_type_count: self.old_type_count.context("no type section was found")?,
-            start: self.start,
+            start_fn_idx: self.start_fn_idx,
             data: output_data,
         })
     }
@@ -637,8 +592,8 @@ fn reencode_with_unpacker<'a>(
                         .instruction(&we::Instruction::I32Const(MEM_SIZE - original_data_end))
                         .instruction(&we::Instruction::MemoryFill(0));
 
-                    if let Some(start) = &self.info.start {
-                        func.instruction(&we::Instruction::Call(start.function_idx));
+                    if let Some(start) = self.info.start_fn_idx {
+                        func.instruction(&we::Instruction::Call(start));
                     }
                     func.instruction(&we::Instruction::End);
                     code.function(&func);
