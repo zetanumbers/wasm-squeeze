@@ -5,47 +5,27 @@ use std::{
     process,
 };
 
-const USAGE: &str = "\
-USAGE: xtask build-unpacker [WASI_SDK_PATH]
+use clap::{Parser, Subcommand};
 
-`WASI_SDK_PATH` argument may also be passed as an environment variable
-";
-
-enum Args {
-    BuildUnpacker { wasi_sdk: PathBuf },
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-impl Args {
-    fn parse_args() -> Result<Self, pico_args::Error> {
-        let mut args = pico_args::Arguments::from_env();
-        let subcommand = args.subcommand()?;
-        let Some(subcommand) = subcommand else {
-            return Err(pico_args::Error::MissingArgument);
-        };
-        if subcommand != "build-unpacker" {
-            return Err(pico_args::Error::ArgumentParsingFailed {
-                cause: format!("Unknown subcommand: {subcommand}"),
-            });
-        }
-        Ok(Args::BuildUnpacker {
-            wasi_sdk: args
-                .opt_free_from_os_str(|s| Result::<_, std::convert::Infallible>::Ok(s.to_owned()))?
-                .or_else(|| env::var_os("WASI_SDK_PATH"))
-                .ok_or(pico_args::Error::MissingArgument)?
-                .into(),
-        })
-    }
+#[derive(Subcommand)]
+enum Commands {
+    BuildUnpacker {
+        #[arg(env = "WASI_SDK_PATH")]
+        wasi_sdk: PathBuf,
+    },
 }
 
 fn main() -> process::ExitCode {
-    let Args::BuildUnpacker { wasi_sdk } = match Args::parse_args() {
-        Ok(a) => a,
-        Err(err) => {
-            eprintln!("Error: {err}\n");
-            eprintln!("{}", USAGE);
-            return process::ExitCode::FAILURE;
-        }
-    };
+    let Args {
+        command: Commands::BuildUnpacker { wasi_sdk },
+    } = Args::parse();
 
     let cargo = std::env::var_os("CARGO");
     let cargo = cargo.as_deref().unwrap_or("cargo".as_ref());
