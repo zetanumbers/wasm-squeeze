@@ -81,8 +81,9 @@ fn try_main() -> anyhow::Result<()> {
     let mut info = RelevantInfoBuilder::new();
     let input = parse_stream_and_save(input, |payload| info.add_payload(payload))
         .context("parsing input as wasm module")?;
-    let info = match info.build(&input) {
-        Ok(info) => info,
+    // Input, but with mitigations like edited data count
+    let (info, mitigated_input) = match info.build(&input) {
+        Ok(x) => x,
         Err(err) => {
             for cause in err.chain() {
                 if cause.is::<NoDataError>() {
@@ -97,7 +98,7 @@ fn try_main() -> anyhow::Result<()> {
     log::debug!("Retrieved relevant info from the input module:\n{info:#?}");
     let unpacker = UnpackerComponents::parse();
 
-    let module = reencode_with_unpacker(&input, info, unpacker, args.level)?;
+    let module = reencode_with_unpacker(&mitigated_input, info, unpacker, args.level)?;
     let output = module.finish();
 
     let reduced_bytes = input.len() as isize - output.len() as isize;
@@ -262,6 +263,7 @@ struct RelevantInfoBuilder {
     old_functions: Option<Vec<u32>>,
     old_type_count: Option<u32>,
     import_function_count: Option<u32>,
+    data_count_range: Option<Range<usize>>,
 }
 
 impl RelevantInfoBuilder {
@@ -272,11 +274,22 @@ impl RelevantInfoBuilder {
             old_functions: None,
             old_type_count: None,
             import_function_count: None,
+            data_count_range: None,
         }
     }
 
     fn add_payload(&mut self, payload: wp::Payload) -> anyhow::Result<()> {
         match payload {
+            wp::Payload::DataCountSection { count, range } => {
+                if count != 1 {
+                    anyhow::ensure!(
+                        self.data_count_range.is_none(),
+                        "encountered multiple data count sections"
+                    );
+
+                    self.data_count_range = Some(range);
+                }
+            }
             wp::Payload::DataSection(data) => {
                 anyhow::ensure!(self.data.is_empty(), "encountered multiple data sections");
                 self.data.reserve(data.count().try_into()?);
@@ -348,10 +361,30 @@ impl RelevantInfoBuilder {
         Ok(())
     }
 
-    fn build(mut self, input: &[u8]) -> anyhow::Result<RelevantInfo> {
+    /// Return info and modified input with mitigations like edited data count section
+    fn build(mut self, input: &[u8]) -> anyhow::Result<(RelevantInfo, Vec<u8>)> {
         if self.data.is_empty() {
             return Err(NoDataError.into());
         }
+
+        let mut input = input.to_owned();
+
+        if let Some(range) = self.data_count_range {
+            // replacing value for the input buffer data count, which is stored as LEB128
+            let varint = input
+                .get_mut(range)
+                .context("invalid range for data count sections")?;
+            match varint {
+                [] => anyhow::bail!("data count range is empty"),
+                [byte] => *byte = 1,
+                [first, middle @ .., last] => {
+                    *first = 0x81;
+                    middle.fill(0x80);
+                    *last = 0;
+                }
+            }
+        }
+
         // zero sized data is't supported
         self.data.sort_unstable_by_key(|d| d.offset);
 
@@ -377,13 +410,16 @@ impl RelevantInfoBuilder {
         let old_functions = self
             .old_functions
             .context("no function section encountered")?;
-        Ok(RelevantInfo {
-            old_function_count: old_functions.len().try_into().unwrap(),
-            import_function_count: self.import_function_count.unwrap_or(0),
-            old_type_count: self.old_type_count.context("no type section was found")?,
-            start_fn_idx: self.start_fn_idx,
-            data: output_data,
-        })
+        Ok((
+            RelevantInfo {
+                old_function_count: old_functions.len().try_into().unwrap(),
+                import_function_count: self.import_function_count.unwrap_or(0),
+                old_type_count: self.old_type_count.context("no type section was found")?,
+                start_fn_idx: self.start_fn_idx,
+                data: output_data,
+            },
+            input,
+        ))
     }
 }
 
@@ -619,8 +655,8 @@ fn reencode_with_unpacker<'a>(
 
         fn parse_export_section(
             &mut self,
-            exports: &mut wasm_encoder::ExportSection,
-            section: wasmparser::ExportSectionReader<'_>,
+            exports: &mut we::ExportSection,
+            section: wp::ExportSectionReader<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
             if self.packed_data.is_none() {
                 return reencode::utils::parse_export_section(self, exports, section);
