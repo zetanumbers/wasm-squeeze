@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask"]
+members = [".", "common", "xtask"]
 
 [package]
 name = "wasm-squeeze"
@@ -10,6 +10,7 @@ license = "Apache-2.0 OR MIT"
 [dependencies]
 anyhow = { version = "1.0.86", features = ["std"] }
 clap = { version = "4.5.16", features = ["derive"] }
+common = { version = "0.1.0", path = "common" }
 env_logger = { version = "0.11.5", default-features = false, features = ["auto-color"] }
 log = "0.4.22"
 upkr = { git = "https://github.com/exoticorn/upkr.git", version = "0.2.2" }

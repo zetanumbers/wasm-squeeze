@@ -1,8 +1,9 @@
-use core::fmt;
 use std::{
     error::Error,
+    fmt,
     fs::File,
     io::{self, IsTerminal, Write},
+    iter,
     ops::Range,
     path::{Path, PathBuf},
     process,
@@ -36,6 +37,10 @@ const WASM_FEATURES: wp::WasmFeatures = {
         .union(Ft::TAIL_CALL)
 };
 const UNPACKER_WASM: &[u8] = include_bytes!("upkr_unpacker.wasm");
+
+const MEM_SIZE: i32 = 0x10000;
+const CONTEXT_OFFSET: i32 = 0;
+const COMPRESSED_DATA_OFFSET: i32 = common::CONTEXT_SIZE;
 
 #[derive(Parser)]
 struct Args {
@@ -90,7 +95,7 @@ fn try_main() -> anyhow::Result<()> {
         }
     };
     log::debug!("Retrieved relevant info from the input module:\n{info:#?}");
-    let unpacker = UnpackerComponents::parse(UNPACKER_WASM).unwrap();
+    let unpacker = UnpackerComponents::parse();
 
     let module = reencode_with_unpacker(&input, info, unpacker, args.level)?;
     let output = module.finish();
@@ -182,16 +187,17 @@ where
 #[derive(Debug)]
 struct RelevantInfo {
     stack: Stack,
-    start: Start,
+    start: Option<Start>,
     data: Data<Vec<u8>>,
     old_function_count: u32,
     old_type_count: u32,
+    import_function_count: u32,
 }
 
 #[derive(Debug)]
 struct Stack {
     global_idx: u32,
-    mem_range: Range<u32>,
+    mem_range: Range<i32>,
 }
 
 #[derive(Debug)]
@@ -200,10 +206,19 @@ struct Start {
     export_idx: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Data<D> {
-    offset: u32,
+    offset: i32,
     data: D,
+}
+
+impl fmt::Debug for Data<Vec<u8>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Data")
+            .field("offset", &self.offset)
+            .field("data", &format_args!("[u8; {}]", self.data.len()))
+            .finish()
+    }
 }
 
 impl Data<Range<usize>> {
@@ -223,7 +238,7 @@ impl Data<Range<usize>> {
             };
             debug_assert_eq!(memory_index, 0, "multimemory is not supported");
             debug_assert_eq!(
-                eval_u32(&offset_expr).context("evaluating data offset")?,
+                eval_i32(&offset_expr).context("evaluating data offset")?,
                 self.offset,
                 "parsed data offset mismatch"
             );
@@ -248,8 +263,8 @@ impl Data<&[u8]> {
 impl RelevantInfo {
     fn unpacker_reencoder(&self) -> AdaptUnpacker {
         AdaptUnpacker {
-            old_function_count: self.old_function_count,
-            old_type_count: self.old_type_count,
+            functions_index_base: self.old_function_count + self.import_function_count,
+            types_index_base: self.old_type_count,
         }
     }
 }
@@ -258,8 +273,9 @@ struct RelevantInfoBuilder {
     stack: Option<Stack>,
     start: Option<Start>,
     data: Vec<Data<Range<usize>>>,
-    old_function_count: Option<u32>,
+    old_functions: Option<Vec<u32>>,
     old_type_count: Option<u32>,
+    import_function_count: Option<u32>,
 }
 
 impl RelevantInfoBuilder {
@@ -268,8 +284,9 @@ impl RelevantInfoBuilder {
             stack: None,
             start: None,
             data: Vec::new(),
-            old_function_count: None,
+            old_functions: None,
             old_type_count: None,
+            import_function_count: None,
         }
     }
 
@@ -290,7 +307,7 @@ impl RelevantInfoBuilder {
                         );
                         self.stack = Some(Stack {
                             global_idx: i.try_into().unwrap(),
-                            mem_range: 0..eval_u32(&global.init_expr)
+                            mem_range: 0..eval_i32(&global.init_expr)
                                 .context("evaluating presumed stack global")?,
                         });
                     }
@@ -310,19 +327,37 @@ impl RelevantInfoBuilder {
                     };
                     anyhow::ensure!(*memory_index == 0, "multi memory is not supported");
                     let offset =
-                        eval_u32(&offset_expr).context("evaluating a data offset expression")?;
+                        eval_i32(&offset_expr).context("evaluating a data offset expression")?;
                     self.data.push(Data {
                         data: data.range,
                         offset,
                     })
                 }
             }
+            wp::Payload::ImportSection(imports) => {
+                anyhow::ensure!(
+                    self.import_function_count.is_none(),
+                    "encountered multiple import sections"
+                );
+                anyhow::ensure!(
+                    self.old_functions.is_none(),
+                    "encountered imports after the function section"
+                );
+                let mut import_function_count = 0;
+                for import in imports {
+                    let import = import?;
+                    if let wp::TypeRef::Func(_) = import.ty {
+                        import_function_count += 1;
+                    }
+                }
+                self.import_function_count = Some(import_function_count);
+            }
             wp::Payload::FunctionSection(functions) => {
                 anyhow::ensure!(
-                    self.old_function_count.is_none(),
+                    self.old_functions.is_none(),
                     "encountered multiple function sections"
                 );
-                self.old_function_count = Some(functions.count());
+                self.old_functions = Some(functions.into_iter().collect::<Result<_, _>>()?);
             }
             wp::Payload::TypeSection(types) => {
                 anyhow::ensure!(
@@ -339,8 +374,8 @@ impl RelevantInfoBuilder {
                     }
                     anyhow::ensure!(self.start.is_none(), "found multiple `start` exports");
                     self.start = Some(Start {
-                        export_idx: export.index,
-                        function_idx: i.try_into().unwrap(),
+                        export_idx: i.try_into().unwrap(),
+                        function_idx: export.index,
                     });
                 }
             }
@@ -383,11 +418,15 @@ impl RelevantInfoBuilder {
             "stack space intersects initialized memory"
         );
 
+        let old_functions = self
+            .old_functions
+            .context("no function section encountered")?;
         Ok(RelevantInfo {
             stack,
-            old_function_count: self.old_function_count.unwrap_or(0),
-            old_type_count: self.old_type_count.unwrap_or(0),
-            start: self.start.context("`start` export was not found")?,
+            old_function_count: old_functions.len().try_into().unwrap(),
+            import_function_count: self.import_function_count.unwrap_or(0),
+            old_type_count: self.old_type_count.context("no type section was found")?,
+            start: self.start,
             data: output_data,
         })
     }
@@ -397,7 +436,7 @@ impl RelevantInfoBuilder {
 struct NoDataError;
 
 impl fmt::Display for NoDataError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         "no data to compress".fmt(f)
     }
 }
@@ -408,38 +447,49 @@ struct UnpackerComponents<'a> {
     types: wp::TypeSectionReader<'a>,
     functions: wp::FunctionSectionReader<'a>,
     function_bodies: Vec<wp::FunctionBody<'a>>,
+    unpack_fn_idx: u32,
 }
 
 impl<'a> UnpackerComponents<'a> {
-    fn parse(data: &'a [u8]) -> anyhow::Result<Self> {
+    fn parse() -> Self {
+        let data = UNPACKER_WASM;
         let mut types = None;
         let mut functions = None;
         let mut function_bodies = Vec::new();
         let mut parser = wp::Parser::new(0);
+        let mut unpack_fn_idx = None;
         parser.set_features(WASM_FEATURES);
 
         for payload in parser.parse_all(data) {
-            match payload? {
+            match payload.unwrap() {
                 wp::Payload::TypeSection(t) => {
-                    anyhow::ensure!(types.is_none(), "multiple type sections found");
+                    assert!(types.is_none(), "multiple type sections found");
                     types = Some(t);
                 }
                 wp::Payload::FunctionSection(f) => {
-                    anyhow::ensure!(functions.is_none(), "multiple function sections found");
+                    assert!(functions.is_none(), "multiple function sections found");
                     functions = Some(f);
                 }
                 wp::Payload::CodeSectionStart { count, .. } => {
                     function_bodies.reserve(count.try_into().unwrap())
                 }
                 wp::Payload::CodeSectionEntry(function) => function_bodies.push(function),
+                wp::Payload::ExportSection(exports) => {
+                    let mut exports = exports.into_iter();
+                    let export = exports.next().unwrap().unwrap();
+                    assert!(unpack_fn_idx.is_none());
+                    unpack_fn_idx = Some(export.index);
+                    assert!(exports.next().is_none());
+                }
                 _ => (),
             }
         }
-        Ok(UnpackerComponents {
+        UnpackerComponents {
             types: types.unwrap(),
             functions: functions.unwrap(),
+            unpack_fn_idx: unpack_fn_idx.unwrap(),
             function_bodies,
-        })
+        }
     }
 }
 
@@ -450,11 +500,37 @@ fn reencode_with_unpacker<'a>(
     compression_level: u8,
 ) -> anyhow::Result<we::Module> {
     let mut module = we::Module::new();
+
+    let packed_data = upkr::pack(
+        &info.data.data,
+        compression_level,
+        &upkr::Config::default(),
+        None,
+    );
+    let packed_data = if info.data.data.len() <= packed_data.len() {
+        log::warn!("Could not compress data into less bytes, writing old");
+        None
+    } else if usize::try_from(MEM_SIZE).unwrap()
+        < packed_data.len() + usize::try_from(common::CONTEXT_SIZE).unwrap() + info.data.data.len()
+    {
+        log::warn!("Decompression requires more than 64KiB space, writing old");
+        None
+    } else {
+        Some(packed_data)
+    };
+
     let mut merger = Merger {
         function_bodies_left: info.old_function_count,
+        unpack_fn_idx: info.import_function_count
+            + info.old_function_count
+            + unpacker.unpack_fn_idx,
+        subroutine_fn_type_idx: info.old_type_count + unpacker.types.count(),
+        new_start_fn_idx: info.import_function_count
+            + info.old_function_count
+            + unpacker.functions.count(),
         info,
+        packed_data,
         unpacker,
-        compression_level,
     };
     merger.parse_core_module(&mut module, wp::Parser::new(0), input_module)?;
 
@@ -464,7 +540,10 @@ fn reencode_with_unpacker<'a>(
         info: RelevantInfo,
         unpacker: UnpackerComponents<'a>,
         function_bodies_left: u32,
-        compression_level: u8,
+        subroutine_fn_type_idx: u32,
+        new_start_fn_idx: u32,
+        unpack_fn_idx: u32,
+        packed_data: Option<Vec<u8>>,
     }
 
     impl<'a> Reencode for Merger<'a> {
@@ -476,36 +555,43 @@ fn reencode_with_unpacker<'a>(
             section: wp::TypeSectionReader<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
             reencode::utils::parse_type_section(self, types, section)?;
+            assert_eq!(types.len(), self.info.old_type_count);
             reencode::utils::parse_type_section(
                 &mut self.info.unpacker_reencoder(),
                 types,
                 self.unpacker.types.clone(),
             )?;
+            assert_eq!(types.len(), self.subroutine_fn_type_idx);
+            types.function(iter::empty(), iter::empty());
             Ok(())
         }
 
         fn parse_function_section(
             &mut self,
-            functions: &mut wasm_encoder::FunctionSection,
-            section: wasmparser::FunctionSectionReader<'_>,
+            functions: &mut we::FunctionSection,
+            section: wp::FunctionSectionReader<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
             reencode::utils::parse_function_section(self, functions, section)?;
+            assert_eq!(functions.len(), self.info.old_function_count);
             reencode::utils::parse_function_section(
                 &mut self.info.unpacker_reencoder(),
                 functions,
                 self.unpacker.functions.clone(),
             )?;
+            functions.function(self.subroutine_fn_type_idx);
             Ok(())
         }
 
         fn parse_function_body(
             &mut self,
-            code: &mut wasm_encoder::CodeSection,
-            func: wasmparser::FunctionBody<'_>,
+            code: &mut we::CodeSection,
+            func: wp::FunctionBody<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
             reencode::utils::parse_function_body(self, code, func)?;
             self.function_bodies_left -= 1;
             if self.function_bodies_left == 0 {
+                // Last function body parsed
+                assert_eq!(code.len(), self.info.old_function_count);
                 let mut unpacker_reencoder = self.info.unpacker_reencoder();
                 for func in &self.unpacker.function_bodies {
                     reencode::utils::parse_function_body(
@@ -513,6 +599,49 @@ fn reencode_with_unpacker<'a>(
                         code,
                         func.clone(),
                     )?;
+                }
+                if self.packed_data.is_some() {
+                    assert_eq!(
+                        self.info.import_function_count + code.len(),
+                        self.new_start_fn_idx
+                    );
+                    let mut func = we::Function::new(iter::empty());
+
+                    let original_data_len = self.info.data.data.len().try_into().unwrap();
+                    let destination_offset = MEM_SIZE.checked_sub(original_data_len).unwrap();
+                    let original_data_offset = self.info.data.offset.try_into().unwrap();
+                    assert!(destination_offset >= 0);
+
+                    func.instruction(&we::Instruction::I32Const(CONTEXT_OFFSET))
+                        .instruction(&we::Instruction::I32Const(destination_offset))
+                        .instruction(&we::Instruction::I32Const(COMPRESSED_DATA_OFFSET))
+                        .instruction(&we::Instruction::Call(self.unpack_fn_idx))
+                        .instruction(&we::Instruction::Drop);
+
+                    func.instruction(&we::Instruction::I32Const(original_data_offset))
+                        .instruction(&we::Instruction::I32Const(destination_offset))
+                        .instruction(&we::Instruction::I32Const(original_data_len))
+                        .instruction(&we::Instruction::MemoryCopy {
+                            src_mem: 0,
+                            dst_mem: 0,
+                        });
+
+                    func.instruction(&we::Instruction::I32Const(0))
+                        .instruction(&we::Instruction::I32Const(0))
+                        .instruction(&we::Instruction::I32Const(original_data_offset))
+                        .instruction(&we::Instruction::MemoryFill(0));
+
+                    let original_data_end = original_data_offset + original_data_len;
+                    func.instruction(&we::Instruction::I32Const(original_data_end))
+                        .instruction(&we::Instruction::I32Const(0))
+                        .instruction(&we::Instruction::I32Const(MEM_SIZE - original_data_end))
+                        .instruction(&we::Instruction::MemoryFill(0));
+
+                    if let Some(start) = &self.info.start {
+                        func.instruction(&we::Instruction::Call(start.function_idx));
+                    }
+                    func.instruction(&we::Instruction::End);
+                    code.function(&func);
                 }
             }
             Ok(())
@@ -523,44 +652,64 @@ fn reencode_with_unpacker<'a>(
             data: &mut we::DataSection,
             _section: wp::DataSectionReader<'_>,
         ) -> Result<(), reencode::Error<Self::Error>> {
-            let offset = we::ConstExpr::i32_const(self.info.data.offset as i32);
-            let packed = upkr::pack(
-                &self.info.data.data,
-                self.compression_level,
-                &upkr::Config::default(),
-                None,
-            );
-            if packed.len() < self.info.data.data.len() {
-                data.active(0, &offset, packed);
-                Ok(())
+            if let Some(packed) = self.packed_data.as_deref() {
+                let offset = we::ConstExpr::i32_const(COMPRESSED_DATA_OFFSET);
+                data.active(0, &offset, packed.iter().copied());
             } else {
-                log::warn!("Could not compress data into less bytes, writing old");
+                let offset = we::ConstExpr::i32_const(self.info.data.offset as i32);
                 data.active(0, &offset, self.info.data.data.iter().copied());
-                Ok(())
             }
+            Ok(())
+        }
+
+        fn parse_export_section(
+            &mut self,
+            exports: &mut wasm_encoder::ExportSection,
+            section: wasmparser::ExportSectionReader<'_>,
+        ) -> Result<(), reencode::Error<Self::Error>> {
+            if self.packed_data.is_none() {
+                return reencode::utils::parse_export_section(self, exports, section);
+            }
+
+            let mut start_encoded = false;
+            for export in section {
+                let export = export?;
+                if export.name == "start" {
+                    assert!(!start_encoded);
+                    exports.export("start", we::ExportKind::Func, self.new_start_fn_idx);
+                    start_encoded = true;
+                } else {
+                    reencode::utils::parse_export(self, exports, export)
+                }
+            }
+            if !start_encoded {
+                exports.export("start", we::ExportKind::Func, self.new_start_fn_idx);
+            }
+            Ok(())
         }
     }
 }
 
 struct AdaptUnpacker {
-    old_function_count: u32,
-    old_type_count: u32,
+    functions_index_base: u32,
+    types_index_base: u32,
 }
 
 impl Reencode for AdaptUnpacker {
     type Error = io::Error;
 
     fn type_index(&mut self, ty: u32) -> u32 {
-        ty.checked_add(self.old_type_count).expect("too many types")
+        ty.checked_add(self.types_index_base)
+            .expect("too many types")
     }
 
     fn function_index(&mut self, func: u32) -> u32 {
-        func.checked_add(self.old_function_count)
+        func.checked_add(self.functions_index_base)
             .expect("too many functions")
     }
 }
 
-fn eval_u32(expr: &wp::ConstExpr) -> anyhow::Result<u32> {
+fn eval_i32(expr: &wp::ConstExpr) -> anyhow::Result<i32> {
     let mut reader = expr.get_operators_reader();
     let wp::Operator::I32Const { value } = reader.read()? else {
         anyhow::bail!("Expected expression to be a single `I32Const`");
@@ -569,5 +718,5 @@ fn eval_u32(expr: &wp::ConstExpr) -> anyhow::Result<u32> {
         matches!(reader.read()?, wp::Operator::End),
         "Expression has unexpected succeeding operators"
     );
-    Ok(value as u32)
+    Ok(value as i32)
 }

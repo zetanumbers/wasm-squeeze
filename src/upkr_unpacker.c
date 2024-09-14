@@ -10,6 +10,9 @@ typedef struct Context {
     u8 upkr_probs[1 + 255 + 1 + 2*32 + 2*32];
 } Context;
 
+_Static_assert(sizeof(Context) == CONTEXT_SIZE, "");
+_Static_assert(_Alignof(Context) == 4, "");
+
 int upkr_decode_bit(Context* cx, int context_index) {
     // shift in a full byte until rANS state is >= 4096
     while(cx->upkr_state < 4096) {
