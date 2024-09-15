@@ -24,7 +24,7 @@ You might find stdio support useful for this, just specify "-" as input or outpu
 I have compared all cartridge builds published on the official site ([back then](https://github.com/aduros/wasm4/commit/be6bc297d77592b37d1c1bd53dcbc168a06a2ce1)) processed by `wasm-opt -Oz -uim -all` and the same cartridge builds going through `wasm-squeeze` first and then `wasm-opt` with aformentioned arguments.
 Negative values (size increases) were preserved, however in practice users should measure benefits and not use `wasm-squeeze` in such cases. 
 
-Benchmarks were done on de7e7abd87ed68fc67134cb155fa429e3e6ce889 commit:
+Benchmarks were done on [de7e7ab](https://github.com/zetanumbers/wasm-squeeze/commit/de7e7abd87ed68fc67134cb155fa429e3e6ce889) commit:
 
 |name|old_size|new_size|size_decrease%|
 |-|-|-|-|
