@@ -163,8 +163,8 @@ If `wasm-squeeze` notices that cartridge's size haven't decreased, `wasm-squeeze
 
 ## Credits
 
-Thanks to @exoticorn for implementing the [`upkr`](https://github.com/exoticorn/upkr) crate, responsible for compression and decompression, designed with WASM in mind. Please check out [MicroW8](https://exoticorn.github.io/microw8/), another WebAssembly based fantasy console, which `upkr` was created for.
+Thanks to [@exoticorn](https://github.com/exoticorn) for implementing the [`upkr`](https://github.com/exoticorn/upkr) crate, responsible for compression and decompression, designed with WASM in mind. Please check out [MicroW8](https://exoticorn.github.io/microw8/), another WebAssembly based fantasy console, which `upkr` was created for.
 
-Thanks to @aduros for creating [WASM-4](https://wasm4.org/) project, a beautiful place where spanned such creative community.
+Thanks to [@aduros](https://github.com/aduros) for creating [WASM-4](https://wasm4.org/) project, a beautiful place where spanned such creative community.
 
-Thanks to the folks from @bytecodealliance for creating extensive `wasmparser` and `wasm-encoder` crates.
+Thanks to the folks from [@bytecodealliance](https://github.com/bytecodealliance/) for maintaining extensive for WASM manipulation `wasmparser` and `wasm-encoder` crates.
