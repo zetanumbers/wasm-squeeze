@@ -2,6 +2,8 @@
 
 `wasm-squeeze` is an [UPX](https://github.com/upx/upx)-like tool to compress [WASM-4](https://wasm4.org/) cartridges and embed the decompressor into the binary for it to decompress itself.
 
+Generally speaking, this tool allows to **reduce cartridge's file size**, so that it can be stuffed with some more code and data before reaching 64KiB file size boundary of WASM-4! However right now it doesn't reduce RAM consumption.
+
 ## Installation
 
 Use cargo for now:
