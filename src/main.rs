@@ -50,13 +50,13 @@ const MOUSE_XY_OFFSET: i32 = 0x1a;
 
 #[derive(Parser)]
 struct Args {
-    // Input wasm file path. Use `-` or don't specify to use stdin.
+    /// Input wasm file path. Specify `-` to use stdin.
     #[clap(default_value = "-")]
     input: PathBuf,
-    // Output wasm file path. Use `-` or don't specify to use stdout.
+    /// Output wasm file path. Specify `-` to use stdout.
     #[clap(short, long, default_value = "-")]
     output: PathBuf,
-    // The compression level (0-9)
+    /// The compression level (0-9)
     #[clap(short, long, default_value = "9")]
     level: u8,
 }
