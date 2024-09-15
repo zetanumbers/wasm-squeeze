@@ -42,7 +42,7 @@ const MEM_SIZE: i32 = 0x10000;
 const CONTEXT_OFFSET: i32 = 0;
 const COMPRESSED_DATA_OFFSET: i32 = common::CONTEXT_SIZE;
 const PALETTE_OFFSET: i32 = 4;
-const PALETTE_DEFAULT: i128 = 0xe0f8cf86c06c306850071821;
+const PALETTE_DEFAULT: [i64; 2] = [0x0086c06c_00e0f8cf, 0x00071821_00306850];
 const DRAW_COLORS_DEFAULT: i16 = 0x1203;
 const DRAW_COLORS_OFFSET: i32 = 0x14;
 const MOUSE_XY_DEFAULT: i32 = 0x7fff7fff;
@@ -694,13 +694,15 @@ fn reencode_with_unpacker<'a>(
                 .instruction(&we::Instruction::I32Const(MEM_SIZE - original_data_end))
                 .instruction(&we::Instruction::MemoryFill(0));
 
-            func.instruction(&we::Instruction::I32Const(PALETTE_OFFSET))
-                .instruction(&we::Instruction::V128Const(PALETTE_DEFAULT))
-                .instruction(&we::Instruction::V128Store(we::MemArg {
-                    offset: 0,
-                    align: 2,
-                    memory_index: 0,
-                }));
+            for (i, &palette_chunk) in PALETTE_DEFAULT.iter().enumerate() {
+                func.instruction(&we::Instruction::I32Const(PALETTE_OFFSET + 8 * i as i32))
+                    .instruction(&we::Instruction::I64Const(palette_chunk))
+                    .instruction(&we::Instruction::I64Store(we::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+            }
 
             func.instruction(&we::Instruction::I32Const(DRAW_COLORS_OFFSET))
                 .instruction(&we::Instruction::I32Const(DRAW_COLORS_DEFAULT.into()))
