@@ -18,7 +18,7 @@ cargo install wasm-squeeze --locked --git https://github.com/zetanumbers/wasm-sq
 wasm-squeeze example.wasm -o example-squeezed.wasm
 ```
 
-Please note that this tool may introduce redundant information into the crate, so it's most probably desirable to use `wasm-opt` after the cartridge going through `wasm-squeeze`.
+Please note that this tool may introduce redundant information into the cartridge, so it's most probably desirable to use `wasm-opt` after the module got through `wasm-squeeze`.
 You might find stdio support useful for this, just specify "-" as input or output filepaths (not specifying those works too).
 
 ## Compression benchmarks
