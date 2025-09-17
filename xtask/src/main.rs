@@ -7,6 +7,8 @@ use std::{
 
 use clap::{Parser, Subcommand};
 
+const CONTEXT_SIZE: i32 = include!("../../src/context_size.txt");
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -79,7 +81,7 @@ fn main() -> process::ExitCode {
     let clang_status = process::Command::new(clang)
         .args(["--sysroot".as_ref(), sysroot.as_os_str()])
         .args(cflags)
-        .arg(format!("-DCONTEXT_SIZE={}", common::CONTEXT_SIZE))
+        .arg(format!("-DCONTEXT_SIZE={}", CONTEXT_SIZE))
         .arg(source_file)
         .args(["-o".as_ref(), output_wasm.as_os_str()])
         .status()

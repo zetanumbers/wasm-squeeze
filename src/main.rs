@@ -40,7 +40,8 @@ const UNPACKER_WASM: &[u8] = include_bytes!("upkr_unpacker.wasm");
 
 const MEM_SIZE: i32 = 0x10000;
 const CONTEXT_OFFSET: i32 = 0;
-const COMPRESSED_DATA_OFFSET: i32 = common::CONTEXT_SIZE;
+const CONTEXT_SIZE: i32 = include!("context_size.txt");
+const COMPRESSED_DATA_OFFSET: i32 = CONTEXT_SIZE;
 const PALETTE_OFFSET: i32 = 4;
 const PALETTE_DEFAULT: [i64; 2] = [0x0086c06c_00e0f8cf, 0x00071821_00306850];
 const DRAW_COLORS_DEFAULT: i16 = 0x1203;
@@ -511,7 +512,7 @@ fn reencode_with_unpacker<'a>(
         log::warn!("Could not compress data into less bytes, writing old");
         None
     } else if usize::try_from(MEM_SIZE).unwrap()
-        < packed_data.len() + usize::try_from(common::CONTEXT_SIZE).unwrap() + info.data.data.len()
+        < packed_data.len() + usize::try_from(CONTEXT_SIZE).unwrap() + info.data.data.len()
     {
         log::warn!("Decompression requires more than 64KiB space, writing old");
         None
