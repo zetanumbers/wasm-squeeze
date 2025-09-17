@@ -9,7 +9,7 @@ Generally speaking, this tool allows to **reduce cartridge's file size**, so tha
 Use cargo for now:
 
 ```
-cargo install wasm-squeeze --locked --git https://github.com/zetanumbers/wasm-squeeze.git
+cargo install wasm-squeeze
 ```
 
 ## Usage
