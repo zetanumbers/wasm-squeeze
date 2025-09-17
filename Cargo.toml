@@ -6,6 +6,12 @@ name = "wasm-squeeze"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
+description = "UPX-like utility to create self-decompressable WASM-4 cartridges"
+authors = ["Daria Sukhonina <dariasukhonina@gmail.com>"]
+documentation = "https://docs.rs/wasm-squeeze"
+repository = "https://github.com/zetanumbers/wasm-squeeze"
+keywords = ["gamedev", "wasm4"]
+categories = ["command-line-utilities", "development-tools::build-utils", "compression", "wasm"]
 
 [dependencies]
 anyhow = { version = "1.0.86", features = ["std"] }
