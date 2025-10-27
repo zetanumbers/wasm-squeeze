@@ -3,7 +3,7 @@ members = [".", "xtask"]
 
 [package]
 name = "wasm-squeeze"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 description = "UPX-like utility to create self-decompressable WASM-4 cartridges"
@@ -18,6 +18,6 @@ anyhow = { version = "1.0.86", features = ["std"] }
 clap = { version = "4.5.16", features = ["derive"] }
 env_logger = { version = "0.11.5", default-features = false, features = ["auto-color"] }
 log = "0.4.22"
-upkr = { git = "https://github.com/exoticorn/upkr.git", version = "0.2.2" }
+upkr = "0.2.3"
 wasm-encoder = { version = "0.214.0", features = ["wasmparser"] }
 wasmparser = "0.214.0"

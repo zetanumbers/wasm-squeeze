@@ -425,7 +425,8 @@ checksum = "f63a545481291138910575129486daeaf8ac54aee4387fe7906919f7830c7d9d"
 [[package]]
 name = "upkr"
 version = "0.2.3"
-source = "git+https://github.com/exoticorn/upkr.git#a9e56d9d50d1f64cab7590f2c584a12b173e7715"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2172e0ddb0eedac5beca061e50450657b688c5f389f9ee89510f7d707c964c39"
 dependencies = [
  "anyhow",
  "cdivsufsort",
@@ -485,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-squeeze"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
